@@ -1,8 +1,8 @@
 use std::env;
 
 use async_native_tls::TlsConnector;
-use chrono::{Duration, Utc};
 use chrono::Datelike;
+use chrono::{Duration, Utc};
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -13,7 +13,6 @@ use futures_util::stream::TryStreamExt;
 
 //read from accounts.json for now
 const ACCOUNTS_JSON: &str = include_str!("../accounts.json");
-
 
 #[derive(Deserialize, Debug, Clone)]
 enum FetchSince {
@@ -26,7 +25,7 @@ struct AccountConfig {
     imap_user: String,
     tls_port: Option<u16>,
     imap_pass: String,
-    fetch_since :  Option<FetchSince>,
+    fetch_since: Option<FetchSince>,
 }
 
 #[tokio::main]
@@ -87,41 +86,30 @@ async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error
 
     loop {
         let query = match &config.fetch_since {
-             Some(FetchSince::Days(days)) => {
-        let date = Utc::now().date_naive() - Duration::days(*days as i64);
-   
-        let formatted = format!(
-            "{}-{}-{}",
-            date.day(),
-            date.format("%b"),
-            date.year()
-        );
-        format!("UNSEEN SINCE {}", formatted)
-    }
+            Some(FetchSince::Days(days)) => {
+                let date = Utc::now().date_naive() - Duration::days(*days as i64);
+
+                let formatted = format!("{}-{}-{}", date.day(), date.format("%b"), date.year());
+                format!("UNSEEN SINCE {}", formatted)
+            }
             None => "UNSEEN".to_string(),
         };
         let uids: Vec<Uid> = session.uid_search(&query).await?.into_iter().collect();
 
         if uids.is_empty() {
-            log::info!("[{}] No unseen messages. Starting IDLE...", user);
+            log::info!("[{}] No new messages. Entering IDLE mode...", user);
 
             let mut idle = session.idle();
             idle.init().await?;
 
-            // Wait for up to 29 minutes (servers typically disconnect after 30 minutes)
-            let (wait_fut, _) = idle.wait_with_timeout(std::time::Duration::from_secs(29 * 60));
-            match wait_fut.await {
-                Ok(response) => {
-                    log::debug!("[{}] Got IMAP update: {:?}", user, response);
-                    //close idle
-                    idle.done().await?;
-                    break;
-                }
-                Err(e) => {
-                    log::error!("[{}] Error in IDLE loop: {}", user, e);
-                    return Err(e.into());
-                }
-            }
+            let (idle_wait, _interrupt) =
+                idle.wait_with_timeout(std::time::Duration::from_secs(300));
+
+            idle_wait.await?;
+
+            session = idle.done().await?;
+
+            log::info!("[{}] IDLE completed. Checking for new messages...", user);
         } else {
             log::info!(
                 "[{}] Found {} unseen messages. Fetching...",
@@ -191,6 +179,4 @@ async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error
             log::info!("[{}] Processed {} messages", user, processed_uids.len());
         }
     }
-
-    Ok(())
 }
