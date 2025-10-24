@@ -1,6 +1,8 @@
 use std::env;
 
 use async_native_tls::TlsConnector;
+use chrono::{Duration, Utc};
+use chrono::Datelike;
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -12,12 +14,19 @@ use futures_util::stream::TryStreamExt;
 //read from accounts.json for now
 const ACCOUNTS_JSON: &str = include_str!("../accounts.json");
 
+
+#[derive(Deserialize, Debug, Clone)]
+enum FetchSince {
+    Days(u32),
+}
+
 #[derive(Deserialize, Debug, Clone)]
 struct AccountConfig {
     imap_domain: String,
     imap_user: String,
     tls_port: Option<u16>,
     imap_pass: String,
+    fetch_since :  Option<FetchSince>,
 }
 
 #[tokio::main]
@@ -77,7 +86,21 @@ async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error
     session.select("INBOX").await?;
 
     loop {
-        let uids: Vec<Uid> = session.uid_search("UNSEEN").await?.into_iter().collect();
+        let query = match &config.fetch_since {
+             Some(FetchSince::Days(days)) => {
+        let date = Utc::now().date_naive() - Duration::days(*days as i64);
+   
+        let formatted = format!(
+            "{}-{}-{}",
+            date.day(),
+            date.format("%b"),
+            date.year()
+        );
+        format!("UNSEEN SINCE {}", formatted)
+    }
+            None => "UNSEEN".to_string(),
+        };
+        let uids: Vec<Uid> = session.uid_search(&query).await?.into_iter().collect();
 
         if uids.is_empty() {
             log::info!("[{}] No unseen messages. Starting IDLE...", user);
