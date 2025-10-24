@@ -1,0 +1,26 @@
+[package]
+name = "email_ingester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+# IMAP client
+async-imap = "0.11"
+async-native-tls = "0.5"
+
+# rabbitmq client
+lapin = "3.7"
+
+# logging
+log = "0.4"
+env_logger = "0.11"
+
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+futures = "0.3"
+futures-util = "0.3"
