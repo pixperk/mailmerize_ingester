@@ -1,15 +1,19 @@
 use std::env;
+use std::sync::Arc;
 
 use async_native_tls::TlsConnector;
 use chrono::Datelike;
-use chrono::{Duration, Utc};
-use serde::Deserialize;
+use chrono::{DateTime, Duration, Utc};
+use lapin::{Channel, Connection, ConnectionProperties, BasicProperties};
+use lapin::options::BasicPublishOptions;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
 use async_imap::{Client, types::Uid};
 use futures_util::future::join_all;
 use futures_util::stream::TryStreamExt;
+use mailparse::{parse_mail, MailHeaderMap};
 
 //read from accounts.json for now
 const ACCOUNTS_JSON: &str = include_str!("../accounts.json");
@@ -28,6 +32,40 @@ struct AccountConfig {
     fetch_since: Option<FetchSince>,
 }
 
+#[derive(Serialize, Debug)]
+struct EmailHeaders {
+    subject: Option<String>,
+    from: Option<String>,
+    to: Vec<String>,
+    cc: Vec<String>,
+    date: Option<String>,
+    message_id: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct EmailBody {
+    text: Option<String>,
+    html: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+struct AttachmentInfo {
+    filename: String,
+    content_type: String,
+    size: usize,
+}
+
+#[derive(Serialize, Debug)]
+struct EmailMessage {
+    uid: u32,
+    account: String,
+    ingested_at: DateTime<Utc>,
+    headers: EmailHeaders,
+    body: EmailBody,
+    has_attachments: bool,
+    attachments: Vec<AttachmentInfo>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
@@ -35,15 +73,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env_logger::init();
 
-    //setup amqp connection [later]
+    let channel = connect_rabbitmq().await?;
+    let channel = Arc::new(channel);
 
     let accounts: Vec<AccountConfig> = serde_json::from_str(ACCOUNTS_JSON)?;
 
     let mut tasks = Vec::new();
 
     for account in accounts {
+
+            let channel = channel.clone();
+            
+
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = process_account(account.clone()).await {
+            if let Err(e) = process_account(account.clone(), channel).await {
                 log::error!("[{}] Worker failed: {}", account.imap_user, e);
             }
         }));
@@ -53,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn process_account(config: AccountConfig, channel: Arc<Channel>) -> Result<(), Box<dyn std::error::Error>> {
     log::info!("[{}] Starting worker", config.imap_user);
 
     let user = &config.imap_user;
@@ -123,7 +166,7 @@ async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error
                 .join(",");
 
             let message_stream = session
-                .uid_fetch(sequence_set.clone(), "(UID BODY.PEEK[HEADER])")
+                .uid_fetch(sequence_set.clone(), "(UID BODY.PEEK[])")
                 .await?;
 
             let mut processed_uids = Vec::new();
@@ -132,35 +175,17 @@ async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error
 
                 while let Some(msg) = message_stream.try_next().await? {
                     if let Some(uid) = msg.uid {
-                        log::info!("[{}] Message UID: {}", user, uid);
+                        let body_bytes = msg.body().unwrap_or(&[]);
 
-                        let header_bytes = msg.header().or_else(|| msg.body());
-
-                        if let Some(header_bytes) = header_bytes {
-                            let header_str = String::from_utf8_lossy(header_bytes);
-                            log::debug!("[{}] Raw header:\n{}", user, header_str);
-
-                            let mut subject: Option<String> = None;
-                            for line in header_str.lines() {
-                                let trimmed = line.trim();
-                                if trimmed.to_ascii_lowercase().starts_with("subject:") {
-                                    subject = Some(trimmed["subject:".len()..].trim().to_string());
-                                    break;
-                                }
+                        match parse_and_publish_email(uid, body_bytes, user, &channel).await {
+                            Ok(_) => {
+                                log::info!("[{}] Ingested UID {}", user, uid);
+                                processed_uids.push(uid);
                             }
-
-                            if let Some(subj) = subject {
-                                log::info!("[{}] Subject: {}", user, subj);
-                            } else {
-                                log::warn!("[{}] No Subject header for UID {}", user, uid);
+                            Err(e) => {
+                                log::error!("[{}] Failed to process UID {}: {}", user, uid, e);
                             }
-
-                            log::info!("[{}] {}", user, "=".repeat(80));
-                        } else {
-                            log::warn!("[{}] No header found for UID {}", user, uid);
                         }
-
-                        processed_uids.push(uid);
                     }
                 }
             }
@@ -179,4 +204,130 @@ async fn process_account(config: AccountConfig) -> Result<(), Box<dyn std::error
             log::info!("[{}] Processed {} messages", user, processed_uids.len());
         }
     }
+}
+
+async fn connect_rabbitmq() -> Result<Channel, lapin::Error> {
+    let amqp_addr =
+        env::var("AMQP_ADDR").unwrap_or_else(|_| "amqp://guest:guest@127.0.0.1:5672/%2f".into());
+
+    log::info!("Connecting to RabbitMQ at {}...", amqp_addr);
+    let conn = Connection::connect(&amqp_addr, ConnectionProperties::default()).await?;
+    let channel = conn.create_channel().await?;
+
+    let queue = env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "email_tasks".into());
+
+    let _queue = channel
+        .queue_declare(
+            &queue,
+            lapin::options::QueueDeclareOptions::default(),
+            lapin::types::FieldTable::default(),
+        )
+        .await?;
+
+    Ok(channel)
+}
+
+async fn parse_and_publish_email(
+    uid: u32,
+    email_bytes: &[u8],
+    account: &str,
+    channel: &Channel,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_mail(email_bytes)?;
+
+    // Extract headers
+    let headers = EmailHeaders {
+        subject: parsed.headers.get_first_value("Subject"),
+        from: parsed.headers.get_first_value("From"),
+        to: parsed
+            .headers
+            .get_all_values("To")
+            .into_iter()
+            .collect(),
+        cc: parsed
+            .headers
+            .get_all_values("Cc")
+            .into_iter()
+            .collect(),
+        date: parsed.headers.get_first_value("Date"),
+        message_id: parsed.headers.get_first_value("Message-ID"),
+    };
+
+    // Extract body parts
+    let mut body_text = None;
+    let mut body_html = None;
+    let mut attachments = Vec::new();
+
+    fn extract_parts(
+        part: &mailparse::ParsedMail,
+        text: &mut Option<String>,
+        html: &mut Option<String>,
+        attachments: &mut Vec<AttachmentInfo>,
+    ) {
+        let content_type = part.ctype.mimetype.as_str();
+
+        match content_type {
+            "text/plain" if part.get_content_disposition().disposition == mailparse::DispositionType::Inline => {
+                if text.is_none() {
+                    *text = part.get_body().ok();
+                }
+            }
+            "text/html" if part.get_content_disposition().disposition == mailparse::DispositionType::Inline => {
+                if html.is_none() {
+                    *html = part.get_body().ok();
+                }
+            }
+            _ => {
+                let disposition = part.get_content_disposition();
+                if disposition.disposition == mailparse::DispositionType::Attachment {
+                    let filename = disposition
+                        .params
+                        .get("filename")
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    attachments.push(AttachmentInfo {
+                        filename,
+                        content_type: content_type.to_string(),
+                        size: part.get_body_raw().map(|b| b.len()).unwrap_or(0),
+                    });
+                }
+            }
+        }
+
+        for subpart in &part.subparts {
+            extract_parts(subpart, text, html, attachments);
+        }
+    }
+
+    extract_parts(&parsed, &mut body_text, &mut body_html, &mut attachments);
+
+    let email_message = EmailMessage {
+        uid,
+        account: account.to_string(),
+        ingested_at: Utc::now(),
+        headers,
+        body: EmailBody {
+            text: body_text,
+            html: body_html,
+        },
+        has_attachments: !attachments.is_empty(),
+        attachments,
+    };
+
+    // Publish to RabbitMQ
+    let queue = env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "email_tasks".into());
+    let payload = serde_json::to_vec(&email_message)?;
+
+    channel
+        .basic_publish(
+            "",
+            &queue,
+            BasicPublishOptions::default(),
+            &payload,
+            BasicProperties::default(),
+        )
+        .await?;
+
+    Ok(())
 }
