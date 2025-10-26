@@ -6,6 +6,7 @@ use chrono::Datelike;
 use chrono::{DateTime, Duration, Utc};
 use lapin::{Channel, Connection, ConnectionProperties, BasicProperties};
 use lapin::options::BasicPublishOptions;
+use redis::aio::ConnectionManager;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio_util::compat::TokioAsyncReadCompatExt;
@@ -14,6 +15,8 @@ use async_imap::{Client, types::Uid};
 use futures_util::future::join_all;
 use futures_util::stream::TryStreamExt;
 use mailparse::{parse_mail, MailHeaderMap};
+
+mod redis_util;
 
 //read from accounts.json for now
 const ACCOUNTS_JSON: &str = include_str!("../accounts.json");
@@ -67,7 +70,7 @@ struct EmailMessage {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     unsafe {
         env::set_var("RUST_LOG", "info");
     }
@@ -76,17 +79,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channel = connect_rabbitmq().await?;
     let channel = Arc::new(channel);
 
+    let redis_client = redis_util::create_redis_client().await?;
+    let redis_client = Arc::new(redis_client);
+
     let accounts: Vec<AccountConfig> = serde_json::from_str(ACCOUNTS_JSON)?;
 
     let mut tasks = Vec::new();
 
     for account in accounts {
-
-            let channel = channel.clone();
-            
+        let channel = channel.clone();
+        let redis_client = redis_client.clone();
 
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = process_account(account.clone(), channel).await {
+            if let Err(e) = process_account(account.clone(), channel, redis_client).await {
                 log::error!("[{}] Worker failed: {}", account.imap_user, e);
             }
         }));
@@ -96,7 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn process_account(config: AccountConfig, channel: Arc<Channel>) -> Result<(), Box<dyn std::error::Error>> {
+async fn process_account(
+    config: AccountConfig,
+    channel: Arc<Channel>,
+    redis_client: Arc<ConnectionManager>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     log::info!("[{}] Starting worker", config.imap_user);
 
     let user = &config.imap_user;
@@ -137,7 +146,23 @@ async fn process_account(config: AccountConfig, channel: Arc<Channel>) -> Result
             }
             None => "UNSEEN".to_string(),
         };
-        let uids: Vec<Uid> = session.uid_search(&query).await?.into_iter().collect();
+        let all_uids: Vec<Uid> = session.uid_search(&query).await?.into_iter().collect();
+
+       
+        let mut uids = Vec::new();
+        let mut redis_conn = redis_client.as_ref().clone();
+        for uid in all_uids {
+            match redis_util::is_message_processed(&mut redis_conn, user, uid).await {
+                Ok(false) => uids.push(uid),
+                Ok(true) => {
+                    log::debug!("[{}] UID {} already processed, skipping", user, uid);
+                }
+                Err(e) => {
+                    log::error!("[{}] Redis error checking UID {}: {}", user, uid, e);
+                    uids.push(uid);
+                }
+            }
+        }
 
         if uids.is_empty() {
             log::info!("[{}] No new messages. Entering IDLE mode...", user);
@@ -180,6 +205,13 @@ async fn process_account(config: AccountConfig, channel: Arc<Channel>) -> Result
                         match parse_and_publish_email(uid, body_bytes, user, &channel).await {
                             Ok(_) => {
                                 log::info!("[{}] Ingested UID {}", user, uid);
+
+                               
+                                let mut redis_conn = redis_client.as_ref().clone();
+                                if let Err(e) = redis_util::mark_message_processed(&mut redis_conn, user, uid).await {
+                                    log::error!("[{}] Failed to mark UID {} as processed in Redis: {}", user, uid, e);
+                                }
+
                                 processed_uids.push(uid);
                             }
                             Err(e) => {
@@ -188,17 +220,6 @@ async fn process_account(config: AccountConfig, channel: Arc<Channel>) -> Result
                         }
                     }
                 }
-            }
-
-            if !processed_uids.is_empty() {
-                let uid_sequence = processed_uids
-                    .iter()
-                    .map(|uid| uid.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-
-                let store_stream = session.uid_store(uid_sequence, "+FLAGS (\\Seen)").await?;
-                let _store_responses: Vec<_> = store_stream.try_collect().await?;
             }
 
             log::info!("[{}] Processed {} messages", user, processed_uids.len());
@@ -235,7 +256,7 @@ async fn parse_and_publish_email(
     email_bytes: &[u8],
     account: &str,
     channel: &Channel,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let parsed = parse_mail(email_bytes)?;
 
     // Extract headers
