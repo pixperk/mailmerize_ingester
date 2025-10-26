@@ -216,13 +216,16 @@ async fn connect_rabbitmq() -> Result<Channel, lapin::Error> {
 
     let queue = env::var("RABBITMQ_QUEUE").unwrap_or_else(|_| "email_tasks".into());
 
-    let _queue = channel
-        .queue_declare(
-            &queue,
-            lapin::options::QueueDeclareOptions::default(),
-            lapin::types::FieldTable::default(),
-        )
-        .await?;
+let _queue = channel
+    .queue_declare(
+        &queue,
+        lapin::options::QueueDeclareOptions {
+            durable: true,
+            ..Default::default()
+        },
+        lapin::types::FieldTable::default(),
+    )
+    .await?;
 
     Ok(channel)
 }
