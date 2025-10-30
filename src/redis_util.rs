@@ -18,46 +18,51 @@ pub async fn create_redis_client() -> Result<ConnectionManager, RedisError> {
 
 pub async fn is_message_processed(
     conn: &mut ConnectionManager,
+    user_id: &str,
     account: &str,
     uid: u32,
 ) -> Result<bool, RedisError> {
-    let key = format!("processed_emails:{}", account);
+    let key = format!("processed_emails:{}:{}", user_id, account);
     conn.sismember(&key, uid).await
 }
 
 
 pub async fn mark_message_processed(
     conn: &mut ConnectionManager,
+    user_id: &str,
     account: &str,
     uid: u32,
 ) -> Result<(), RedisError> {
-    let key = format!("processed_emails:{}", account);
+    let key = format!("processed_emails:{}:{}", user_id, account);
     conn.sadd(&key, uid).await
 }
 
 
 pub async fn get_processed_uids(
     conn: &mut ConnectionManager,
+    user_id: &str,
     account: &str,
 ) -> Result<Vec<u32>, RedisError> {
-    let key = format!("processed_emails:{}", account);
+    let key = format!("processed_emails:{}:{}", user_id, account);
     conn.smembers(&key).await
 }
 
 
 pub async fn clear_processed_uids(
     conn: &mut ConnectionManager,
+    user_id: &str,
     account: &str,
 ) -> Result<(), RedisError> {
-    let key = format!("processed_emails:{}", account);
+    let key = format!("processed_emails:{}:{}", user_id, account);
     conn.del(&key).await
 }
 
 
 pub async fn get_processed_count(
     conn: &mut ConnectionManager,
+    user_id: &str,
     account: &str,
 ) -> Result<usize, RedisError> {
-    let key = format!("processed_emails:{}", account);
+    let key = format!("processed_emails:{}:{}", user_id, account);
     conn.scard(&key).await
 }
